@@ -1,0 +1,79 @@
+name: test
+on: [push, workflow_dispatch]
+jobs:
+  run:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash   # = bash -eo pipefail, so '| tee' does not hide a failing script
+    steps:
+      - uses: actions/checkout@v4
+      - name: syntax + shellcheck
+        run: |
+          bash -n monero-node-vps.sh
+          shellcheck -S warning monero-node-vps.sh
+      - name: help
+        run: bash monero-node-vps.sh --help
+      - name: bad input is refused
+        run: |
+          if sudo bash monero-node-vps.sh --bogus --yes; then echo 'expected a failure'; exit 1; fi
+          if sudo bash monero-node-vps.sh --tarball /nonexistent --yes; then echo 'expected a failure'; exit 1; fi
+      - name: a tampered release file is refused (fail closed)
+        run: |
+          echo "not monero" > /tmp/monero-linux-x64-fake.tar.bz2
+          rc=0; sudo bash monero-node-vps.sh --tarball /tmp/monero-linux-x64-fake.tar.bz2 --no-start --yes > /tmp/out.txt 2>&1 || rc=$?
+          cat /tmp/out.txt
+          [ "$rc" -ne 0 ] || { echo 'expected a failure'; exit 1; }
+          grep -q 'Signature OK' /tmp/out.txt        # the signed hashes.txt was checked first
+          grep -q 'SHA256 MISMATCH' /tmp/out.txt
+          if ls /opt/monero/v* 2>/dev/null; then echo 'something was installed'; exit 1; fi
+          if id monero 2>/dev/null; then echo 'user was created'; exit 1; fi
+      - name: turn on ufw (to test the port opening)
+        run: |
+          sudo apt-get update -q && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q ufw
+          sudo ufw allow 22/tcp && sudo ufw --force enable
+      - name: full install (real download + signature + SHA256 check, not started)
+        run: sudo bash monero-node-vps.sh --public-rpc --no-start --yes
+      - name: checks
+        run: |
+          id monero
+          /opt/monero/current/monerod --version
+          grep -qx 'prune-blockchain=1' /etc/monerod.conf
+          grep -qx 'rpc-restricted-bind-port=18089' /etc/monerod.conf
+          grep -qx 'rpc-bind-ip=127.0.0.1' /etc/monerod.conf
+          systemctl is-enabled monerod
+          sudo systemd-analyze verify /etc/systemd/system/monerod.service
+          sudo ufw status | grep '18080/tcp.*ALLOW' > /dev/null
+          sudo ufw status | grep '18089/tcp.*ALLOW' > /dev/null
+          test "$(stat -c %U /var/lib/monero)" = monero
+      - name: second run is safe (no new download, same config)
+        run: |
+          before="$(sha256sum /etc/monerod.conf /etc/systemd/system/monerod.service)"
+          sudo bash monero-node-vps.sh --public-rpc --no-start --yes | tee /tmp/out2.txt
+          grep -q 'already installed' /tmp/out2.txt
+          test "$before" = "$(sha256sum /etc/monerod.conf /etc/systemd/system/monerod.service)"
+      - name: --full is refused on top of a pruned blockchain
+        run: |
+          sudo install -d -o monero -g monero /var/lib/monero/lmdb
+          if sudo bash monero-node-vps.sh --full --no-start --yes; then echo 'expected a failure'; exit 1; fi
+          sudo rmdir /var/lib/monero/lmdb
+      - name: start briefly, check both RPC ports answer, stop (no full sync in CI)
+        run: |
+          sudo systemctl start monerod
+          for i in $(seq 1 60); do
+            curl -fsS --max-time 5 http://127.0.0.1:18081/get_info > /tmp/info.json 2>/dev/null && break
+            sleep 3
+          done
+          grep -Eq '"status": ?"OK"' /tmp/info.json
+          curl -fsS --max-time 5 http://127.0.0.1:18089/get_info | grep -E '"restricted": ?true' > /dev/null
+          sudo bash monero-node-vps.sh --public-rpc --yes | tee /tmp/out3.txt
+          grep -q 'nothing to restart' /tmp/out3.txt
+          sudo bash monero-node-vps.sh --yes        # drop --public-rpc: config changes, monerod restarts
+          if grep -q 18089 /etc/monerod.conf; then echo 'public rpc still configured'; exit 1; fi
+          if sudo ufw status | grep '18089/tcp' > /dev/null; then echo '18089 still open'; exit 1; fi
+          sleep 5; systemctl is-active monerod
+          sudo systemctl stop monerod
